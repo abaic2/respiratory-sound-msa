@@ -1,0 +1,1 @@
+python main.py --tag bs8_lr5e-5_ep50_seed1 --dataset icbhi --seed 0 --class_split lungsound --n_cls 4 --epochs 50 --batch_size 1 --optimizer adam --learning_rate 5e-5 --weight_decay 1e-6 --cosine --model ast --test_fold official --pad_types repeat --resz 1 --n_mels 128 --ma_update --ma_beta 0.5 --from_sl_official --audioset_pretrained --method ce 

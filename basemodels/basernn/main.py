@@ -1,0 +1,475 @@
+import os
+import sys
+import json
+import warnings
+warnings.filterwarnings("ignore")
+os.environ["CUDA_VISIBLE_DEVICES"] = "2" 
+# 设置无缓冲输出以便实时显示日志
+import sys
+sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', buffering=1)
+print("程序启动中...")
+
+import math
+import time
+import random
+import pickle
+import argparse
+import numpy as np
+from copy import deepcopy
+from datetime import datetime, timedelta
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.backends.cudnn as cudnn
+from torchvision import transforms
+
+from util.icbhi_dataset import ICBHIDataset
+from util.icbhi_util import get_score
+from util.misc import adjust_learning_rate, warmup_learning_rate, set_optimizer, update_moving_average
+from util.misc import AverageMeter, accuracy, save_model, update_json
+from models import get_backbone_class, Projector
+from method import PatchMixLoss, PatchMixConLoss
+from trainer import train, validate, run_epoch, init_swanlab
+
+
+def parse_args():
+    parser = argparse.ArgumentParser('argument for RNN model training')
+
+    parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--print_freq', type=int, default=1)
+    parser.add_argument('--save_freq', type=int, default=100)
+    parser.add_argument('--save_dir', type=str, default='./save/16/')
+    parser.add_argument('--tag', type=str, default='',
+                        help='tag for experiment name')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='path of model checkpoint to resume')
+    parser.add_argument('--eval', action='store_true',
+                        help='only evaluation with pretrained encoder and classifier')
+    parser.add_argument('--two_cls_eval', action='store_true',
+                        help='evaluate with two classes')
+    
+    # optimization
+    parser.add_argument('--optimizer', type=str, default='adam')
+    parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--learning_rate', type=float, default=1e-3)
+    parser.add_argument('--lr_decay_epochs', type=str, default='30,40')
+    parser.add_argument('--lr_decay_rate', type=float, default=0.1)
+    parser.add_argument('--weight_decay', type=float, default=1e-4)
+    parser.add_argument('--momentum', type=float, default=0.9)
+    parser.add_argument('--cosine', action='store_true',
+                        help='using cosine annealing')
+    parser.add_argument('--warm', action='store_true',
+                        help='warm-up for large batch training')
+    parser.add_argument('--warm_epochs', type=int, default=0,
+                        help='warmup epochs')
+    parser.add_argument('--weighted_loss', action='store_true',
+                        help='weighted cross entropy loss (higher weights on abnormal class)')
+    parser.add_argument('--mix_beta', default=1.0, type=float,
+                        help='patch-mix interpolation coefficient')
+    parser.add_argument('--time_domain', action='store_true',
+                        help='patchmix for the specific time domain')
+
+    # dataset
+    parser.add_argument('--dataset', type=str, default='icbhi')
+    parser.add_argument('--data_folder', type=str, default='/home/yujieyang/bishe/data/ICBHI_final_database')
+    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--num_workers', type=int, default=8)
+    # icbhi dataset
+    parser.add_argument('--class_split', type=str, default='lungsound',
+                        help='lungsound: (normal, crackles, wheezes, both), diagnosis: (healthy, chronic diseases, non-chronic diseases)')
+    parser.add_argument('--n_cls', type=int, default=4,
+                        help='set k-way classification problem')
+    parser.add_argument('--test_fold', type=str, default='official', choices=['official', '0', '1', '2', '3', '4'],
+                        help='test fold to use official 60-40 split or 80-20 split from RespireNet')
+    parser.add_argument('--weighted_sampler', action='store_true',
+                        help='weighted sampler inversly proportional to class ratio')
+    parser.add_argument('--stetho_id', type=int, default=-1, 
+                        help='stethoscope device id, use only when finetuning on each stethoscope data')
+    parser.add_argument('--sample_rate', type=int,  default=16000, 
+                        help='sampling rate when load audio data, and it denotes the number of samples per one second')
+    parser.add_argument('--butterworth_filter', type=int, default=None, 
+                        help='apply specific order butterworth band-pass filter')
+    parser.add_argument('--desired_length', type=int,  default=8, 
+                        help='fixed length size of individual cycle')
+    parser.add_argument('--pad_types', type=str,  default='repeat', 
+                        help='zero: zero-padding, repeat: padding with duplicated samples, aug: padding with augmented samples')
+    parser.add_argument('--raw_augment', type=int, default=0, 
+                        help='control how many number of augmented raw audio samples')
+    
+    # 时序特征参数
+    parser.add_argument('--feature_type', type=str, default='time_domain',
+                        help='time sequence feature type: time_domain, sequential, raw', 
+                        choices=['time_domain', 'sequential', 'raw'])
+    parser.add_argument('--frame_length', type=int, default=1024,
+                        help='frame length for feature extraction')
+    parser.add_argument('--hop_length', type=int, default=512,
+                        help='hop length for feature extraction')
+
+    # model
+    parser.add_argument('--model', type=str, default='gru')
+    parser.add_argument('--model_size', type=str, default='medium',
+                        help='model size (small, medium, large)')
+    parser.add_argument('--freeze_base', action='store_true',
+                      help='freeze the base layers of RNN models')
+    parser.add_argument('--freeze_layers', type=int, default=0,
+                      help='number of layers to freeze in RNN models')
+    parser.add_argument('--ma_update', action='store_true',
+                        help='whether to use moving average update for model')
+    parser.add_argument('--ma_beta', type=float, default=0,
+                        help='moving average value')
+    
+    parser.add_argument('--method', type=str, default='ce')
+
+    args = parser.parse_args()
+
+    iterations = args.lr_decay_epochs.split(',')
+    args.lr_decay_epochs = list([])
+    for it in iterations:
+        args.lr_decay_epochs.append(int(it))
+    
+    args.model_name = '{}_{}_{}'.format(args.dataset, args.model, args.method)
+    if args.tag:
+        args.model_name += '_{}'.format(args.tag)
+    
+    args.save_folder = os.path.join(args.save_dir, args.model_name)
+    if not os.path.isdir(args.save_folder):
+        os.makedirs(args.save_folder)
+
+    if args.warm:
+        args.warmup_from = args.learning_rate * 0.1
+        args.warm_epochs = 10
+        if args.cosine:
+            eta_min = args.learning_rate * (args.lr_decay_rate ** 3)
+            args.warmup_to = eta_min + (args.learning_rate - eta_min) * (
+                    1 + math.cos(math.pi * args.warm_epochs / args.epochs)) / 2
+        else:
+            args.warmup_to = args.learning_rate
+
+    if args.dataset == 'icbhi':
+        if args.class_split == 'lungsound':
+            if args.n_cls == 4:
+                args.cls_list = ['normal', 'crackle', 'wheeze', 'both']
+            elif args.n_cls == 2:
+                args.cls_list = ['normal', 'abnormal']
+        elif args.class_split == 'diagnosis':
+            if args.n_cls == 3:
+                args.cls_list = ['healthy', 'chronic_diseases', 'non-chronic_diseases']
+            elif args.n_cls == 2:
+                args.cls_list = ['healthy', 'unhealthy']
+    else:
+        raise NotImplementedError
+
+    return args
+
+
+def set_loader(args):
+    if args.dataset == 'icbhi':
+        # 创建一个简单变换，不需要图像调整大小
+        train_transform = transforms.Compose([]) 
+        val_transform = transforms.Compose([])
+
+        train_dataset = ICBHIDataset(train_flag=True, transform=train_transform, args=args, print_flag=True)
+        val_dataset = ICBHIDataset(train_flag=False, transform=val_transform, args=args, print_flag=True)
+
+        # 从数据集获取实际的特征维度，供模型使用
+        args.input_fdim = train_dataset.feat_dim if hasattr(train_dataset, 'feat_dim') else 128
+        args.input_tdim = train_dataset.seq_len if hasattr(train_dataset, 'seq_len') else 1024
+        
+        print(f"从数据集获取特征维度: features={args.input_fdim}, timesteps={args.input_tdim}")
+
+        # for weighted_loss
+        args.class_nums = train_dataset.class_nums
+    else:
+        raise NotImplemented    
+    
+    if args.weighted_sampler:
+        reciprocal_weights = []
+        for idx in range(len(train_dataset)):
+            reciprocal_weights.append(train_dataset.class_ratio[train_dataset.labels[idx]])
+        weights = (1 / torch.Tensor(reciprocal_weights))
+        sampler = torch.utils.data.sampler.WeightedRandomSampler(weights, len(train_dataset))
+    else:
+        sampler = None
+
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=sampler is None,
+                                               num_workers=args.num_workers, pin_memory=True, sampler=sampler, 
+                                               drop_last=True, prefetch_factor=2, persistent_workers=True)
+    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
+                                             num_workers=args.num_workers, pin_memory=True, sampler=None)
+
+    return train_loader, val_loader, args
+
+
+def set_model(args):    
+    kwargs = {}
+    if args.model in ['gru', 'lstm', 'bilstm']:
+        kwargs['input_fdim'] = args.input_fdim
+        kwargs['input_tdim'] = args.input_tdim
+        kwargs['label_dim'] = args.n_cls
+        kwargs['model_size'] = args.model_size
+        kwargs['mix_beta'] = args.mix_beta
+        kwargs['freeze_base'] = args.freeze_base
+        kwargs['freeze_layers'] = args.freeze_layers
+
+    model = get_backbone_class(args.model)(**kwargs)    
+    
+    # 修复：直接使用model.final_feat_dim作为分类器的输入维度
+    # 不要乘以2，因为BiLSTM的final_feat_dim已经包含了双向的维度
+    classifier = nn.Linear(model.final_feat_dim, args.n_cls)
+
+    if not args.weighted_loss:
+        weights = None
+        criterion = nn.CrossEntropyLoss()
+    else:
+        weights = torch.tensor(args.class_nums, dtype=torch.float32)
+        weights = 1.0 / (weights / weights.sum())
+        weights /= weights.sum()
+        
+        criterion = nn.CrossEntropyLoss(weight=weights)
+
+    projector = nn.Identity()
+
+    criterion = [criterion.cuda()]
+
+    if torch.cuda.device_count() > 1:
+        model = torch.nn.DataParallel(model)
+        
+    model.cuda()
+    classifier.cuda()
+    
+    optim_params = list(model.parameters()) + list(classifier.parameters())
+    optimizer = set_optimizer(args, optim_params)
+
+    return model, classifier, projector, criterion, optimizer
+
+
+def main():
+    print("解析命令行参数...")
+    args = parse_args()
+    
+    # 检查CUDA可用性
+    print(f"CUDA是否可用: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+    
+    # 确保保存目录存在
+    try:
+        if not os.path.exists(args.save_folder):
+            os.makedirs(args.save_folder)
+        # 测试写入权限
+        test_file = os.path.join(args.save_folder, 'test_write.txt')
+        with open(test_file, 'w') as f:
+            f.write('test')
+        os.remove(test_file)
+        print(f"存储目录 {args.save_folder} 可写")
+    except Exception as e:
+        print(f"存储目录错误: {e}")
+        return
+    
+    with open(os.path.join(args.save_folder, 'train_args.json'), 'w') as f:
+        json.dump(vars(args), f, indent=4)
+
+    # fix seed
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed(args.seed)
+    cudnn.deterministic = True
+    cudnn.benchmark = True
+    
+    best_model = None
+    if args.dataset == 'icbhi':
+        best_acc = [0, 0, 0]  # Specificity, Sensitivity, Score
+
+    print("加载数据集...")
+    # 降低worker数量，避免潜在的死锁
+    original_workers = args.num_workers
+    args.num_workers = min(4, original_workers)
+    try:
+        train_loader, val_loader, args = set_loader(args)
+        print(f"数据集加载完成。训练集大小: {len(train_loader.dataset)}, 测试集大小: {len(val_loader.dataset)}")
+        
+        # 计算迭代次数
+        steps_per_epoch = len(train_loader)
+        total_steps = steps_per_epoch * args.epochs
+        print(f"每个Epoch的步数: {steps_per_epoch}, 总训练步数: {total_steps}")
+    except Exception as e:
+        print(f"数据集加载错误: {e}")
+        import traceback
+        traceback.print_exc()
+        return
+    
+    print("创建模型...")
+    try:
+        model, classifier, projector, criterion, optimizer = set_model(args)
+            
+        # 显示模型大小
+        model_parameters = filter(lambda p: p.requires_grad, model.parameters())
+        params = sum([np.prod(p.size()) for p in model_parameters])
+        print(f"可训练参数数量: {params:,}")
+        
+        # 输出优化器设置
+        print(f"优化器: {args.optimizer}, 基础学习率: {args.learning_rate}")
+        if args.cosine:
+            print(f"使用余弦学习率衰减")
+        if args.warm:
+            print(f"使用学习率预热: {args.warm_epochs}个epoch, 从{args.warmup_from}到{args.warmup_to}")
+        
+        print("模型创建完成")
+    except Exception as e:
+        print(f"模型创建错误: {e}")
+        import traceback
+        traceback.print_exc()
+        return
+
+    if args.resume:
+        if os.path.isfile(args.resume):
+            print("=> loading checkpoint '{}'".format(args.resume))
+            checkpoint = torch.load(args.resume)
+            args.start_epoch = checkpoint['epoch'] 
+            model.load_state_dict(checkpoint['model'])
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            args.start_epoch += 1
+            print("=> loaded checkpoint '{}' (epoch {})".format(args.resume, checkpoint['epoch']))
+        else:
+            print("=> no checkpoint found at '{}'".format(args.resume))
+    else:
+        args.start_epoch = 1
+
+    # 初始化SwanLab
+    print("初始化SwanLab...")
+    swan = None
+    try:
+        print("直接初始化 SwanLab...")
+        swan = init_swanlab(args)
+        if swan:
+            print("SwanLab 完全初始化成功")
+        else:
+            print("SwanLab 未能成功初始化")
+    except Exception as e:
+        print(f"SwanLab 初始化过程中出现异常: {e}")
+        import traceback
+        traceback.print_exc()
+        swan = None
+
+    # 使用混合精度:
+    print("设置混合精度训练...")
+    scaler = torch.cuda.amp.GradScaler()
+    
+    print('*' * 20)
+    if not args.eval:
+        print('Training for {} epochs on {} dataset using {} model'.format(args.epochs, args.dataset, args.model.upper()))
+        print(f'Feature type: {args.feature_type}, Model size: {args.model_size}')
+        
+        # 显示初始最佳指标
+        print(f"初始最佳 ICBHI: {best_acc[2]:.4f}, SE: {best_acc[1]:.4f}, SP: {best_acc[0]:.4f}")
+        
+        # 初始化训练历史记录
+        train_history = {
+            'epochs': [],
+            'train_loss': [],
+            'train_acc': [],
+            'val_loss': [],
+            'val_acc': []
+        }
+        
+        # 估计完成时间
+        start_time = time.time()
+        epoch_times = []
+        
+        for epoch in range(args.start_epoch, args.epochs+1):
+            epoch_start = time.time()
+            adjust_learning_rate(args, optimizer, epoch)
+            
+            # 显示当前学习率
+            if isinstance(optimizer.param_groups[0], dict):
+                current_lr = optimizer.param_groups[0]['lr']
+                print(f"当前学习率: {current_lr}")
+            
+            try:
+                # 运行一个epoch
+                print(f"开始第 {epoch} 个Epoch...")
+                best_acc, best_model, save_bool, epoch_metrics = run_epoch(
+                    train_loader, val_loader, model, classifier, projector, 
+                    criterion, optimizer, epoch, args, scaler, best_acc, best_model, swan
+                )
+                
+                # 记录训练历史
+                train_history['epochs'].append(epoch)
+                train_history['train_loss'].append(epoch_metrics['train_loss'])
+                train_history['train_acc'].append(epoch_metrics['train_acc'])
+                train_history['val_loss'].append(epoch_metrics['val_loss'])
+                train_history['val_acc'].append(epoch_metrics['val_acc'])
+
+                # 保存周期性检查点
+                if save_bool:
+                    save_file = os.path.join(args.save_folder, 'best_epoch_{}.pth'.format(epoch))
+                    save_model(model, optimizer, args, epoch, save_file, classifier)
+                    
+                if epoch % args.save_freq == 0:
+                    save_file = os.path.join(args.save_folder, 'epoch_{}.pth'.format(epoch))
+                    save_model(model, optimizer, args, epoch, save_file, classifier)
+                
+                # 计算剩余时间
+                epoch_end = time.time()
+                epoch_time = epoch_end - epoch_start
+                epoch_times.append(epoch_time)
+                
+                avg_epoch_time = np.mean(epoch_times[-min(5, len(epoch_times)):])  # 使用最近5个epoch的平均时间
+                remaining_epochs = args.epochs - epoch
+                est_remaining_time = avg_epoch_time * remaining_epochs
+                
+                # 转换为更人性化的格式
+                est_completion_time = datetime.now() + timedelta(seconds=est_remaining_time)
+                est_completion_str = est_completion_time.strftime("%Y-%m-%d %H:%M:%S")
+                
+                print(f"Epoch {epoch}/{args.epochs} 完成, 耗时: {epoch_time:.2f}秒")
+                print(f"估计剩余时间: {timedelta(seconds=int(est_remaining_time))}, 预计完成时间: {est_completion_str}")
+                
+            except Exception as e:
+                print(f"Epoch {epoch} 运行错误: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
+
+        # 训练结束后保存最佳模型
+        if best_model is not None:
+            save_file = os.path.join(args.save_folder, 'best.pth')
+            model.load_state_dict(best_model[0])
+            classifier.load_state_dict(best_model[1])
+            save_model(model, optimizer, args, epoch, save_file, classifier)
+            print(f"训练完成！最佳 ICBHI: {best_acc[2]:.4f}, SE: {best_acc[1]:.4f}, SP: {best_acc[0]:.4f}")
+            
+        # 显示总训练时间
+        total_time = time.time() - start_time
+        print(f"总训练时间: {timedelta(seconds=int(total_time))}")
+    else:
+        print('Testing the pretrained checkpoint on {} dataset'.format(args.dataset))
+        try:
+            _, _, _, metrics = validate(val_loader, model, classifier, criterion, args, best_acc)
+            print(f"测试结果 - ICBHI: {metrics['sc']:.4f}, SE: {metrics['se']:.4f}, SP: {metrics['sp']:.4f}, Acc: {metrics['val_acc']:.2f}%")
+        except Exception as e:
+            print(f"验证错误: {e}")
+            import traceback
+            traceback.print_exc()
+
+    update_json('%s' % args.model_name, best_acc, path=os.path.join(args.save_dir, 'results.json'))
+    
+    # 关闭SwanLab
+    if swan is not None:
+        try:
+            swan.finish()
+            print("SwanLab实验记录完成")
+        except Exception as e:
+            print(f"关闭SwanLab时出错: {e}")
+
+
+if __name__ == '__main__':
+    try:
+        print("程序开始执行...")
+        main()
+    except Exception as e:
+        print(f"程序执行出错: {e}")
+        import traceback
+        traceback.print_exc()
